@@ -113,6 +113,13 @@ const companyStorageKey = 'zoo-variedades-company'
 const brandImageStorageKey = 'zoo-variedades-brand-image'
 const socialStorageKey = 'zoo-variedades-social-links'
 const couponsStorageKey = 'zoo-variedades-coupons'
+const teamUsersStorageKey = 'zoo-variedades-team-users'
+const teamPermissions = [
+  { key: 'identity', label: 'Identidade da loja' },
+  { key: 'coupons', label: 'Cupons de desconto' },
+  { key: 'social', label: 'Redes sociais' },
+  { key: 'products', label: 'Produtos' },
+]
 const defaultCoupons = [
   { code: 'SAVE10', discount: 10, active: true },
   { code: 'WELCOME15', discount: 15, active: true },
@@ -123,6 +130,41 @@ const socialNetworks = [
   { key: 'tiktok', label: 'TikTok', domains: ['tiktok.com'] },
   { key: 'youtube', label: 'YouTube', domains: ['youtube.com', 'youtu.be'] },
 ]
+
+function readTeamUsers() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(teamUsersStorageKey) || '[]')
+    if (!Array.isArray(saved)) return []
+    return saved.filter((user) =>
+      typeof user?.username === 'string' &&
+      /^[a-z0-9._-]{3,30}$/.test(user.username) &&
+      typeof user.salt === 'string' &&
+      typeof user.passwordHash === 'string' &&
+      Array.isArray(user.permissions) &&
+      typeof user.active === 'boolean',
+    ).map((user) => ({
+      ...user,
+      permissions: user.permissions.filter((permission) => teamPermissions.some((entry) => entry.key === permission)),
+    }))
+  } catch {
+    return []
+  }
+}
+
+function encodeBase64(bytes) {
+  return btoa(String.fromCharCode(...new Uint8Array(bytes)))
+}
+
+async function hashPassword(password, salt) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits'])
+  const result = await crypto.subtle.deriveBits({
+    name: 'PBKDF2',
+    salt,
+    iterations: 120000,
+    hash: 'SHA-256',
+  }, key, 256)
+  return encodeBase64(result)
+}
 
 function readSocialLinks(storageKey) {
   let saved
@@ -277,7 +319,12 @@ function App() {
     return safeImageUrl(saved) || safeUploadedImage(saved)
   })
   const [adminAuthenticated, setAdminAuthenticated] = useState(false)
+  const [adminUser, setAdminUser] = useState(null)
   const [adminError, setAdminError] = useState('')
+  const [adminErrorType, setAdminErrorType] = useState('')
+  const [teamUsers, setTeamUsers] = useState(readTeamUsers)
+  const [teamUserMessage, setTeamUserMessage] = useState('')
+  const [teamUserForm, setTeamUserForm] = useState({ username: '', password: '', permissions: ['products'] })
   const [productMessage, setProductMessage] = useState('')
   const [identityMessage, setIdentityMessage] = useState('')
   const [company, setCompany] = useState(() => localStorage.getItem(companyStorageKey) || 'Variedades')
@@ -421,6 +468,7 @@ function App() {
   }
 
   async function handleProductImageUpload(event) {
+    if (!hasAdminPermission('products')) return
     const input = event.currentTarget
     const files = Array.from(input.files || [])
     if (!files.length) return
@@ -459,6 +507,7 @@ function App() {
   }
 
   function saveStoreIdentity() {
+    if (!hasAdminPermission('identity')) return
     const name = companyInput.trim()
     if (!name) {
       setIdentityMessage('Informe o nome da loja.')
@@ -474,6 +523,7 @@ function App() {
   }
 
   async function handleBrandImageUpload(event) {
+    if (!hasAdminPermission('identity')) return
     const input = event.currentTarget
     const file = input.files?.[0]
     if (!file) return
@@ -490,6 +540,7 @@ function App() {
   }
 
   function removeBrandImage() {
+    if (!hasAdminPermission('identity')) return
     try {
       localStorage.removeItem(brandImageStorageKey)
       setBrandImage('')
@@ -501,17 +552,126 @@ function App() {
 
   function handleAdminLogin(event) {
     event.preventDefault()
-    const submittedPassword = new FormData(event.currentTarget).get('password')
-    if (submittedPassword !== adminPassword) {
-      setAdminError('Senha incorreta.')
-      return
+    const formData = new FormData(event.currentTarget)
+    const username = String(formData.get('username') || '').trim().toLowerCase()
+    const submittedPassword = String(formData.get('password') || '')
+    const authenticate = async () => {
+      setAdminErrorType('')
+      if (username === 'admin' && submittedPassword === adminPassword) {
+        setAdminUser({ username: 'admin', isAdmin: true, permissions: teamPermissions.map(({ key }) => key) })
+        setAdminAuthenticated(true)
+        setAdminError('')
+        return
+      }
+      const pausedUser = teamUsers.find((entry) => entry.username === username && entry.active === false)
+      if (pausedUser) {
+        setAdminError('Este login está pausado. Entre em contato com o administrador para reativá-lo.')
+        setAdminErrorType('paused')
+        return
+      }
+      const user = teamUsers.find((entry) => entry.username === username && entry.active)
+      if (!user) {
+        setAdminError('Usuário ou senha inválidos.')
+        setAdminErrorType('')
+        return
+      }
+      try {
+        const salt = Uint8Array.from(atob(user.salt), (character) => character.charCodeAt(0))
+        if (await hashPassword(submittedPassword, salt) !== user.passwordHash) {
+          setAdminError('Usuário ou senha inválidos.')
+          setAdminErrorType('')
+          return
+        }
+        setAdminUser(user)
+        setAdminAuthenticated(true)
+        setAdminError('')
+        setAdminErrorType('')
+      } catch {
+        setAdminError('Não foi possível validar este login neste navegador.')
+        setAdminErrorType('')
+      }
     }
-    setAdminAuthenticated(true)
-    setAdminError('')
+    authenticate()
   }
 
   function handleAdminLogout() {
     setAdminAuthenticated(false)
+    setAdminUser(null)
+    setAdminError('')
+    setAdminErrorType('')
+  }
+
+  function hasAdminPermission(permission) {
+    return adminUser?.isAdmin || adminUser?.permissions.includes(permission)
+  }
+
+  function persistTeamUsers(updatedUsers, successMessage) {
+    try {
+      localStorage.setItem(teamUsersStorageKey, JSON.stringify(updatedUsers))
+      setTeamUsers(updatedUsers)
+      setTeamUserMessage(successMessage)
+      return true
+    } catch {
+      setTeamUserMessage('Não foi possível salvar. Libere espaço no armazenamento do navegador e tente novamente.')
+      return false
+    }
+  }
+
+  async function createTeamUser(event) {
+    event.preventDefault()
+    if (!adminUser?.isAdmin) return
+    const username = teamUserForm.username.trim().toLowerCase()
+    if (!/^[a-z0-9._-]{3,30}$/.test(username)) {
+      setTeamUserMessage('Use um login de 3 a 30 caracteres: letras sem acento, números, ponto, hífen ou sublinhado.')
+      return
+    }
+    if (username === 'admin' || teamUsers.some((user) => user.username === username)) {
+      setTeamUserMessage('Este login já está sendo usado.')
+      return
+    }
+    if (teamUserForm.password.length < 6) {
+      setTeamUserMessage('A senha precisa ter pelo menos 6 caracteres.')
+      return
+    }
+    const permissions = teamPermissions
+      .filter(({ key }) => teamUserForm.permissions.includes(key))
+      .map(({ key }) => key)
+    if (!permissions.length) {
+      setTeamUserMessage('Selecione pelo menos uma permissão para este login.')
+      return
+    }
+    try {
+      const salt = crypto.getRandomValues(new Uint8Array(16))
+      const user = {
+        username,
+        salt: encodeBase64(salt),
+        passwordHash: await hashPassword(teamUserForm.password, salt),
+        permissions,
+        active: true,
+      }
+      if (persistTeamUsers([...teamUsers, user], `Login "${username}" criado.`)) {
+        setTeamUserForm({ username: '', password: '', permissions: ['products'] })
+      }
+    } catch {
+      setTeamUserMessage('Não foi possível criar o login neste navegador.')
+    }
+  }
+
+  function toggleTeamUserStatus(username) {
+    if (!adminUser?.isAdmin) return
+    const updatedUsers = teamUsers.map((user) =>
+      user.username === username ? { ...user, active: !user.active } : user,
+    )
+    const updatedUser = updatedUsers.find((user) => user.username === username)
+    persistTeamUsers(updatedUsers, `Login "${username}" ${updatedUser.active ? 'ativado' : 'pausado'}.`)
+  }
+
+  function deleteTeamUser(username) {
+    if (!adminUser?.isAdmin) return
+    persistTeamUsers(
+      teamUsers.filter((user) => user.username !== username),
+      `Login "${username}" removido.`,
+    )
   }
 
   function changeQty(productId, delta) {
@@ -546,6 +706,7 @@ function App() {
   }
 
   function saveSocialLinks() {
+    if (!hasAdminPermission('social')) return
     const nextLinks = {}
     for (const network of socialNetworks) {
       const value = socialDraft[network.key]?.trim()
@@ -574,6 +735,7 @@ function App() {
   }
 
   function saveCoupon(event) {
+    if (!hasAdminPermission('coupons')) return
     event.preventDefault()
     const code = couponForm.code.trim().toUpperCase()
     const discountValue = Number(couponForm.discount)
@@ -601,6 +763,7 @@ function App() {
   }
 
   function updateCouponStatus(code, active) {
+    if (!hasAdminPermission('coupons')) return
     const updatedCoupons = coupons.map((coupon) =>
       coupon.code === code ? { ...coupon, active } : coupon,
     )
@@ -615,6 +778,7 @@ function App() {
   }
 
   function deleteCoupon(code) {
+    if (!hasAdminPermission('coupons')) return
     const updatedCoupons = coupons.filter((coupon) => coupon.code !== code)
     try {
       localStorage.setItem(couponsStorageKey, JSON.stringify(updatedCoupons))
@@ -635,6 +799,7 @@ function App() {
   }
 
   function submitProduct(event) {
+    if (!hasAdminPermission('products')) return
     event.preventDefault()
     const form = new FormData(event.currentTarget)
     const price = Number(form.get('price'))
@@ -672,6 +837,7 @@ function App() {
   }
 
   function editProduct(product) {
+    if (!hasAdminPermission('products')) return
     setEditingId(product.id)
     const form = document.querySelector('.admin-product-form')
     if (!form) return
@@ -684,6 +850,7 @@ function App() {
   }
 
   function deleteProduct(productId) {
+    if (!hasAdminPermission('products')) return
     const updatedProducts = products.filter((product) => product.id !== productId)
     try {
       localStorage.setItem(STORAGE_KEYS.products, JSON.stringify(updatedProducts))
@@ -739,28 +906,95 @@ function App() {
         <main className="admin-page">
           <a className="admin-back-link" href="/">← Voltar à loja</a>
           {!adminAuthenticated ? (
+            adminErrorType === 'paused' ? (
+              <section className="admin-login-card admin-error-card" role="alert">
+                <div className="admin-error-icon" aria-hidden="true">!</div>
+                <p className="eyebrow">Acesso indisponível</p>
+                <h1>Login pausado</h1>
+                <p>{adminError}</p>
+                <button
+                  className="primary-btn full"
+                  type="button"
+                  onClick={() => { setAdminError(''); setAdminErrorType('') }}
+                >
+                  Tentar novamente
+                </button>
+              </section>
+            ) : (
             <section className="admin-login-card">
               <p className="eyebrow">Área restrita</p>
-              <h1>Acesso administrativo</h1>
-              <p>Senha demo: <strong>zoo2026</strong>. Se configurou outra senha em <code>.env.local</code>, use a senha personalizada.</p>
+              <h1>Acesso da equipe</h1>
+              <p>Entre com seu login. A conta principal usa o login <strong>admin</strong> e a senha configurada para o ambiente.</p>
               <form className="product-form" onSubmit={handleAdminLogin}>
+                <label htmlFor="admin-username">Login</label>
+                <input id="admin-username" name="username" autoComplete="username" required />
                 <label htmlFor="admin-password">Senha</label>
                 <input id="admin-password" name="password" type="password" autoComplete="current-password" required />
                 <button className="primary-btn full" type="submit">Entrar</button>
                 {adminError && <p className="form-message" role="alert">{adminError}</p>}
               </form>
             </section>
+            )
           ) : (
             <>
               <header className="admin-heading">
                 <div>
                   <p className="eyebrow">Área restrita · demonstração</p>
-                  <h1>Gerenciar catálogo</h1>
+                  <h1>Painel da equipe</h1>
+                  <p className="form-hint">Conectado como <strong>{adminUser?.username}</strong>{adminUser?.isAdmin ? ' · administrador' : ''}</p>
                 </div>
                 <button type="button" className="secondary-btn" onClick={handleAdminLogout}>Sair</button>
               </header>
               <section className="admin-content">
-                <section className="panel-box store-identity-panel">
+                {adminUser?.isAdmin && (
+                  <section className="panel-box team-users-panel">
+                    <h2>Logins da equipe</h2>
+                    <p className="form-hint">Crie acessos e escolha quais áreas cada pessoa pode gerenciar.</p>
+                    <form className="product-form" onSubmit={createTeamUser}>
+                      <label htmlFor="team-username">Login
+                        <input id="team-username" value={teamUserForm.username} onChange={(event) => setTeamUserForm((current) => ({ ...current, username: event.target.value }))} autoComplete="off" maxLength={30} required />
+                      </label>
+                      <label htmlFor="team-password">Senha inicial
+                        <input id="team-password" type="password" value={teamUserForm.password} onChange={(event) => setTeamUserForm((current) => ({ ...current, password: event.target.value }))} autoComplete="new-password" minLength={6} required />
+                      </label>
+                      <fieldset className="permission-options">
+                        <legend>Permissões</legend>
+                        {teamPermissions.map(({ key, label }) => (
+                          <label key={key}>
+                            <input
+                              type="checkbox"
+                              checked={teamUserForm.permissions.includes(key)}
+                              onChange={(event) => setTeamUserForm((current) => ({
+                                ...current,
+                                permissions: event.target.checked
+                                  ? [...current.permissions, key]
+                                  : current.permissions.filter((permission) => permission !== key),
+                              }))}
+                            />
+                            {label}
+                          </label>
+                        ))}
+                      </fieldset>
+                      <button className="primary-btn full" type="submit">Criar login</button>
+                    </form>
+                    {teamUserMessage && <p className="form-message" role="status">{teamUserMessage}</p>}
+                    <ul className="coupon-admin-list">
+                      {teamUsers.map((user) => (
+                        <li key={user.username}>
+                          <div>
+                            <strong>{user.username}</strong>
+                            <span>{user.permissions.map((permission) => teamPermissions.find((entry) => entry.key === permission)?.label).join(' · ') || 'Sem permissões'} · {user.active ? 'Ativo' : 'Pausado'}</span>
+                          </div>
+                          <div className="coupon-admin-actions">
+                            <button type="button" className="secondary-btn small" onClick={() => toggleTeamUserStatus(user.username)}>{user.active ? 'Pausar' : 'Ativar'}</button>
+                            <button type="button" className="secondary-btn small danger" onClick={() => deleteTeamUser(user.username)}>Remover</button>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </section>
+                )}
+                {hasAdminPermission('identity') && <section className="panel-box store-identity-panel">
                   <h2>Identidade da loja</h2>
                   <label>Nome da loja<input value={companyInput} onChange={(event) => setCompanyInput(event.target.value)} maxLength={60} /></label>
                   <div className="brand-identity-preview">
@@ -775,8 +1009,8 @@ function App() {
                   </div>
                   <p className="form-hint">JPG, PNG ou WebP · até 10 MB. A imagem é otimizada e salva neste navegador.</p>
                   {identityMessage && <p className="form-message" role="status">{identityMessage}</p>}
-                </section>
-                <section className="panel-box">
+                </section>}
+                {hasAdminPermission('coupons') && <section className="panel-box">
                   <h2>Cupons de desconto</h2>
                   <form className="product-form coupon-admin-form" onSubmit={saveCoupon}>
                     <label htmlFor="new-coupon-code">Código do cupom
@@ -799,8 +1033,8 @@ function App() {
                     ))}
                   </ul>
                   {couponMessage && <p className="form-message" role="status">{couponMessage}</p>}
-                </section>
-                <section className="panel-box social-admin-panel">
+                </section>}
+                {hasAdminPermission('social') && <section className="panel-box social-admin-panel">
                   <h2>Redes sociais</h2>
                   <p className="form-hint">Adicione os links HTTPS dos perfis da loja. Eles aparecem no rodapé da vitrine.</p>
                   <div className="product-form">
@@ -812,47 +1046,51 @@ function App() {
                     <button type="button" className="primary-btn full" onClick={saveSocialLinks}>Salvar redes sociais</button>
                   </div>
                   {socialMessage && <p className="form-message" role="status">{socialMessage}</p>}
-                </section>
-                <div className="panel-box">
-                  <h2>{editingId ? 'Editar produto' : 'Adicionar produto'}</h2>
-                  <form className="product-form admin-product-form" onSubmit={submitProduct}>
-                    <label>Nome<input name="name" required /></label>
-                    <label>Categoria<input name="category" required /></label>
-                    <label>Preço<input name="price" type="number" min="0.01" step="0.01" required /></label>
-                    <label>Fotos do produto (até 5; selecione várias de uma vez)<input type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={handleProductImageUpload} /></label>
-                    {productImages.length > 0 && <div className="admin-image-previews">{productImages.map((image, index) => (
-                      <div key={`${index}-${image.slice(-24)}`}>
-                        <img className="image-upload-preview" src={image} alt={`Prévia ${index + 1} da foto do produto`} />
-                        <button type="button" className="secondary-btn small danger" onClick={() => setProductImages((current) => current.filter((_, imageIndex) => imageIndex !== index))}>Remover foto {index + 1}</button>
+                </section>}
+                {hasAdminPermission('products') && (
+                  <>
+                    <div className="panel-box">
+                      <h2>{editingId ? 'Editar produto' : 'Adicionar produto'}</h2>
+                      <form className="product-form admin-product-form" onSubmit={submitProduct}>
+                        <label>Nome<input name="name" required /></label>
+                        <label>Categoria<input name="category" required /></label>
+                        <label>Preço<input name="price" type="number" min="0.01" step="0.01" required /></label>
+                        <label>Fotos do produto (até 5; selecione várias de uma vez)<input type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={handleProductImageUpload} /></label>
+                        {productImages.length > 0 && <div className="admin-image-previews">{productImages.map((image, index) => (
+                          <div key={`${index}-${image.slice(-24)}`}>
+                            <img className="image-upload-preview" src={image} alt={`Prévia ${index + 1} da foto do produto`} />
+                            <button type="button" className="secondary-btn small danger" onClick={() => setProductImages((current) => current.filter((_, imageIndex) => imageIndex !== index))}>Remover foto {index + 1}</button>
+                          </div>
+                        ))}</div>}
+                        {imageUploadMessage && <p className="form-message" role="status">{imageUploadMessage}</p>}
+                        <label>Descrição<textarea name="description" required /></label>
+                        <label>Estoque demonstrativo<input name="stock" type="number" min="0" /></label>
+                        <button className="primary-btn full" type="submit">{editingId ? 'Salvar alterações' : 'Adicionar produto'}</button>
+                        {productMessage && <p className="form-message" role="status">{productMessage}</p>}
+                      </form>
+                    </div>
+                    <section className="panel-box admin-table">
+                      <h2>Produtos cadastrados</h2>
+                      <div className="table-wrap">
+                        <table>
+                          <thead><tr><th>Produto</th><th>Preço</th><th>Ações</th></tr></thead>
+                          <tbody>{products.map((product) => (
+                            <tr key={product.id}>
+                              <td>{product.name}</td>
+                              <td>{currency.format(product.price)}</td>
+                              <td className="table-actions">
+                                <button type="button" className="secondary-btn small" onClick={() => editProduct(product)}>Editar</button>
+                                <button type="button" className="secondary-btn small danger" onClick={() => deleteProduct(product.id)}>Excluir</button>
+                              </td>
+                            </tr>
+                          ))}</tbody>
+                        </table>
                       </div>
-                    ))}</div>}
-                    {imageUploadMessage && <p className="form-message" role="status">{imageUploadMessage}</p>}
-                    <label>Descrição<textarea name="description" required /></label>
-                    <label>Estoque demonstrativo<input name="stock" type="number" min="0" /></label>
-                    <button className="primary-btn full" type="submit">{editingId ? 'Salvar alterações' : 'Adicionar produto'}</button>
-                    {productMessage && <p className="form-message" role="status">{productMessage}</p>}
-                  </form>
-                </div>
-                <section className="panel-box admin-table">
-                  <h2>Produtos cadastrados</h2>
-                  <div className="table-wrap">
-                    <table>
-                      <thead><tr><th>Produto</th><th>Preço</th><th>Ações</th></tr></thead>
-                      <tbody>{products.map((product) => (
-                        <tr key={product.id}>
-                          <td>{product.name}</td>
-                          <td>{currency.format(product.price)}</td>
-                          <td className="table-actions">
-                            <button type="button" className="secondary-btn small" onClick={() => editProduct(product)}>Editar</button>
-                            <button type="button" className="secondary-btn small danger" onClick={() => deleteProduct(product.id)}>Excluir</button>
-                          </td>
-                        </tr>
-                      ))}</tbody>
-                    </table>
-                  </div>
-                </section>
+                    </section>
+                  </>
+                )}
               </section>
-              <p className="admin-notice">Painel demonstrativo local. Não representa uma área protegida para produção.</p>
+              <p className="admin-notice">Protótipo local: logins, senhas e permissões ficam neste navegador e não protegem dados em produção. Para uso real, conecte o painel a um serviço de autenticação no servidor.</p>
             </>
           )}
         </main>
